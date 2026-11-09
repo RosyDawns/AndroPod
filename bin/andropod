@@ -1,0 +1,6 @@
+#!/bin/sh
+# Thin wrapper so the engine can be driven without touching PYTHONPATH.
+set -e
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PYTHONPATH="$ROOT/engine${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m andropod "$@"

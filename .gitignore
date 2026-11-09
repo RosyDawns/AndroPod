@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+
+# SwiftPM / 构建产物
+.build/
+app/build/
+
+# 运行时数据:镜像与实例都是大二进制,不入库
+# (Alpine 测试镜像用 ./bin/andropod fetch 下载;安卓镜像从 release 页下载,见 README)
+runtime/images/*
+runtime/instances/*
+!runtime/images/.gitkeep
+!runtime/instances/.gitkeep
+
+# 二进制运行时产物(安全网)
+*.qcow2
+*.fd
+*.ppm
+*.pid
+*.sock
+*.log
