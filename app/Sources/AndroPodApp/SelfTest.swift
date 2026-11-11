@@ -27,6 +27,46 @@ enum SelfTest {
 
         for instance in running {
             print("  实例 \(instance.name)：")
+
+            // The fast display path. A headless client that receives real
+            // frames proves the RFB handshake, the shared zlib stream and the
+            // ZRLE tile decoder all work without needing a window.
+            if let port = instance.vncPort {
+                let vnc = VNCClient(port: port)
+                let done = DispatchSemaphore(value: 0)
+                let results = VNCProbe()
+                vnc.callbackQueue = DispatchQueue(label: "selftest.vnc", qos: .userInitiated)
+                vnc.onFrame = { image in
+                    results.images += 1
+                    results.size = image.size
+                    if results.images >= 2 { done.signal() }
+                }
+                vnc.onFailure = { error in
+                    results.error = error.localizedDescription
+                    done.signal()
+                }
+                vnc.start()
+                let timedOut = done.wait(timeout: .now() + 10) == .timedOut
+                let counts = vnc.encodingCounts
+                let size = results.size
+                let error = results.error
+                let images = results.images
+                vnc.stop()
+                if let error {
+                    print("    [FAIL] VNC 127.0.0.1:\(port)：\(error)")
+                    failures += 1
+                } else if images == 0 {
+                    print("    [FAIL] VNC 127.0.0.1:\(port) 没有收到帧")
+                    failures += 1
+                } else {
+                    let codecs = counts.map { "\($0.key):\($0.value)" }.sorted().joined(separator: ",")
+                    print("    [PASS] VNC \(port)：\(images) 帧 \(Int(size.width))x\(Int(size.height))，编码矩形 \(codecs)")
+                    if timedOut { print("    [INFO] 第 2 帧等待超时（静态画面只推一次，属正常）") }
+                }
+            } else {
+                print("    [INFO] 未配置 VNC，GUI 将使用 screendump")
+            }
+
             let scratch = URL(fileURLWithPath: NSTemporaryDirectory())
                 .appendingPathComponent("andropod-selftest-\(instance.name).ppm")
             let client = QMPClient()
@@ -96,4 +136,11 @@ enum SelfTest {
         print(failures == 0 ? "自检通过" : "自检失败 \(failures) 项")
         return failures == 0 ? 0 : 1
     }
+}
+
+/// Result holder for the asynchronous VNC probe above.
+private final class VNCProbe {
+    var images = 0
+    var size = NSSize.zero
+    var error: String?
 }

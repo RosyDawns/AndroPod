@@ -11,6 +11,19 @@ public struct GuestInstance: Identifiable, Hashable {
     /// QEMU's VNC port (5900 + display). Nil when the instance has no VNC
     /// backend, in which case the UI falls back to screendump polling.
     public let vncPort: Int?
+    /// Configured guest display size (MuMu-style "1600 × 945"). Nil on
+    /// instances created before the field existed.
+    public let xres: Int?
+    public let yres: Int?
+    /// Display density metadata shown next to the resolution.
+    public let dpi: Int?
+    /// "2d" (SwiftShader) or "virgl" (host GPU).
+    public let gpuBackend: String
+    /// Whether a virtio touchscreen is attached (games need it).
+    public let touch: Bool
+    /// Direct-boot cmdline switches (user opt-in per instance).
+    public let insecureAdb: Bool
+    public let selinuxPermissive: Bool
 
     public var id: String { name }
     public var serialLog: URL { workdir.appendingPathComponent("serial.log") }
@@ -20,6 +33,33 @@ public struct GuestInstance: Identifiable, Hashable {
     public var pidFile: URL { workdir.appendingPathComponent("qemu.pid") }
     public var commandLine: URL { workdir.appendingPathComponent("qemu.cmd") }
     public var adbSerial: String { "127.0.0.1:\(adbPort)" }
+
+    /// Resolution string for the card; falls back to whatever the live frame
+    /// reports when the stored config predates the resolution fields.
+    public func resolutionString(live: CGSize) -> String {
+        let size: CGSize
+        if let xres, let yres, xres > 0, yres > 0 {
+            size = CGSize(width: xres, height: yres)
+        } else {
+            size = live
+        }
+        return "\(Int(size.width)) × \(Int(size.height)) | \(dpi ?? 160) DPI"
+    }
+}
+
+/// Raises the engine's own window — the only place virgl-rendered pixels
+/// exist. QEMU's cocoa backend runs a real NSApplication, so this needs no
+/// accessibility permission, just the pid it wrote at boot.
+public enum EngineWindow {
+    @discardableResult
+    public static func activate(pidFile: URL) -> Bool {
+        guard let text = try? String(contentsOf: pidFile, encoding: .utf8),
+              let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)),
+              pid > 0,
+              let app = NSRunningApplication(processIdentifier: pid)
+        else { return false }
+        return app.activate(options: [.activateAllWindows])
+    }
 }
 
 public enum WorkspaceError: LocalizedError {
@@ -28,7 +68,8 @@ public enum WorkspaceError: LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case .rootNotFound: return "找不到项目根目录（需包含 bin/andropod）"        case .cliFailed(let output): return output
+        case .rootNotFound: return "找不到项目根目录（需包含 bin/andropod）"
+        case .cliFailed(let output): return output
         }
     }
 }
@@ -43,6 +84,17 @@ public enum ProjectRoot {
         let manager = FileManager.default
         var candidates: [URL] = []
 
+        // 安装版（/Applications/...）：构建时把项目根写进了 bundle。应用装到
+        // 标准位置后，从可执行文件向上再也碰不到 bin/andropod，这个文件是
+        // 唯一可靠的线索。
+        if let data = Bundle.main.url(forResource: "project-root",
+                                      withExtension: "json")
+            .flatMap({ try? Data(contentsOf: $0) }),
+           let object = try? JSONSerialization.jsonObject(with: data) as? [String: String],
+           let path = object["root"] {
+            candidates.append(URL(fileURLWithPath: path))
+        }
+
         if let executable = Bundle.main.executableURL {
             candidates.append(executable)
         }
@@ -50,6 +102,9 @@ public enum ProjectRoot {
             candidates.append(URL(fileURLWithPath: first))
         }
         candidates.append(URL(fileURLWithPath: manager.currentDirectoryPath))
+        // 开发兜底：源码树就在 ~/AndroPod 的场合。
+        candidates.append(URL(fileURLWithPath: NSHomeDirectory())
+            .appendingPathComponent("AndroPod"))
 
         for start in candidates {
             var cursor = start.resolvingSymlinksInPath()
@@ -97,7 +152,15 @@ public final class Workspace {
                     cpus: stored.cpus ?? 4,
                     memoryMB: stored.memoryMB ?? 2048,
                     workdir: entry,
-                    adbPort: Self.adbPort(from: stored.hostfwd) ?? 5555
+                    adbPort: Self.adbPort(from: stored.hostfwd) ?? 5555,
+                    vncPort: stored.vncDisplay.map { 5900 + $0 },
+                    xres: stored.xres,
+                    yres: stored.yres,
+                    dpi: stored.dpi,
+                    gpuBackend: stored.gpuBackend ?? "2d",
+                    touch: stored.touch ?? true,
+                    insecureAdb: stored.insecureAdb ?? false,
+                    selinuxPermissive: stored.selinuxPermissive ?? false
                 )
             )
         }
@@ -123,10 +186,22 @@ public final class Workspace {
         let cpus: Int?
         let memoryMB: Int?
         let hostfwd: [String]?
+        let vncDisplay: Int?
+        let xres: Int?
+        let yres: Int?
+        let dpi: Int?
+        let gpuBackend: String?
+        let touch: Bool?
+        let insecureAdb: Bool?
+        let selinuxPermissive: Bool?
 
         enum CodingKeys: String, CodingKey {
-            case name, cpus, hostfwd
+            case name, cpus, hostfwd, xres, yres, dpi, touch
+            case insecureAdb = "insecure_adb"
+            case selinuxPermissive = "selinux_permissive"
             case memoryMB = "memory_mb"
+            case vncDisplay = "vnc_display"
+            case gpuBackend = "gpu_backend"
         }
     }
 
@@ -134,7 +209,8 @@ public final class Workspace {
 
     /// True only when the pid is alive *and* still belongs to a QEMU process.
     /// A stale pid file plus pid reuse otherwise makes a dead instance look
-    /// alive, which silently breaks the UI.
+    /// alive, which silently breaks the UI. Instances started by the GUI are
+    /// held by `andropod-player`, which carries QEMU inside its own process.
     public func isRunning(_ instance: GuestInstance) -> Bool {
         guard let text = try? String(contentsOf: instance.pidFile, encoding: .utf8),
               let pid = pid_t(text.trimmingCharacters(in: .whitespacesAndNewlines)) else {
@@ -142,7 +218,7 @@ public final class Workspace {
         }
         guard kill(pid, 0) == 0 else { return false }
         guard let path = Self.executablePath(of: pid) else { return false }
-        return path.contains("qemu-system")
+        return path.contains("qemu-system") || path.contains("andropod-player")
     }
 
     private static func executablePath(of pid: pid_t) -> String? {
@@ -153,6 +229,63 @@ public final class Workspace {
     }
 
     // MARK: - control
+
+    /// The player executable: QEMU linked as a library into its own process,
+    /// with the guest's framebuffer attached to a normal AppKit window.
+    /// Bundled next to the manager; the dev path keeps it runnable in place.
+    public var playerURL: URL? {
+        if let override = ProcessInfo.processInfo.environment["ANDROPOD_PLAYER"] {
+            let url = URL(fileURLWithPath: override)
+            if FileManager.default.isExecutableFile(atPath: url.path) { return url }
+        }
+        let bundled = Bundle.main.bundleURL
+            .appendingPathComponent("Contents/MacOS/andropod-player")
+        if FileManager.default.isExecutableFile(atPath: bundled.path) { return bundled }
+        let dev = root.appendingPathComponent("engine/embed/player")
+        if FileManager.default.isExecutableFile(atPath: dev.path) { return dev }
+        return nil
+    }
+
+    /// Starts one player process for one instance.
+    ///
+    /// The caller is expected to run `andropod plan` first: that is what
+    /// clears stale pids/sockets and writes qemu.cmd, which the player reads.
+    /// Launching without it would start a second QEMU on a dirty workdir.
+    public func launchPlayer(_ instance: GuestInstance) throws -> Process {
+        guard let playerURL else {
+            throw WorkspaceError.cliFailed(
+                "找不到 andropod-player。请重新构建应用（app/build.sh）。"
+            )
+        }
+
+        let logURL = instance.workdir.appendingPathComponent("player.log")
+        if !FileManager.default.fileExists(atPath: logURL.path) {
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+        }
+        let log = try FileHandle(forWritingTo: logURL)
+        try log.seekToEnd()
+
+        let process = Process()
+        process.executableURL = playerURL
+        process.arguments = ["--instance", instance.workdir.path]
+        var environment = ProcessInfo.processInfo.environment
+        environment["PATH"] = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        // QEMU dlopens ANGLE's libEGL at display init; dyld only consults this
+        // at exec time, so it has to travel with the child's environment.
+        environment["DYLD_FALLBACK_LIBRARY_PATH"] =
+            "/opt/homebrew/opt/libangle/lib:/opt/homebrew/opt/libepoxy-angle/lib"
+        process.environment = environment
+        process.standardOutput = log
+        process.standardError = log
+        try process.run()
+
+        // Publish the pid immediately: the card must flip to "运行中" without
+        // waiting for the player's own (slightly later) write.
+        try? "\(process.processIdentifier)".write(
+            to: instance.pidFile, atomically: false, encoding: .utf8
+        )
+        return process
+    }
 
     public func run(_ arguments: [String], timeout: TimeInterval = 60) throws -> String {
         let process = Process()

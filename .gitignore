@@ -23,3 +23,19 @@ runtime/instances/*
 *.pid
 *.sock
 *.log
+
+# QEMU 源码树与压缩包（1.8G，第三方上游；获取方式见 docs/08 与 third_party/README）
+third_party/
+
+# 引擎构建产物（engine/embed/build_libqemu.sh 重新生成）
+engine/embed/libandropod-qemu.dylib
+engine/embed/player
+
+# 桌面 APK 的构建产物与本地签名密钥（build-apk.sh 重新生成）
+app/home-apk/out/
+app/home-apk/debug.keystore
+app/home-apk/*.p12
+
+# 运行时临时文件
+runtime/instances/*/
+*.png.orig

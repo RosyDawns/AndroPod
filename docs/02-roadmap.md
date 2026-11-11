@@ -41,9 +41,9 @@ AOSP 官方只提供 `ranchu` 虚拟板的镜像，那是 Android Emulator 专�
 
 ## 阶段 2：可用的产品
 
-- 输入通：键盘、鼠标、触摸注入，按键映射
-- 显示通：内嵌 RFB/VNC 客户端，替代当前 10fps 抓帧
-- 多开：实例模板、批量启动、内存配额、后台实例暂停
+- ~~显示通：内嵌 RFB/VNC 客户端~~ **已完成（2026-11-10）**：Swift RFB 客户端（ZRLE/Tight/Raw/CopyRect，QEMU 的 zlib 流跨矩形共享）已接入 GUI，动态场景 32 fps / 382 KB/s（ZRLE），静态桌面几乎零流量；`screendump` 轮询已从显示路径移除，只作 VNC 失败时的回退。详见 `docs/06-performance.md` 第七节
+- 输入通：QMP `input-send-event` 触摸（~7ms）与 adb keyevent 已通；**剩余：键鼠映射**
+- 多开：实例模板、批量启动、内存配额、后台实例暂停（VNC 端口自动分配已就绪）
 - 快照面板：命名、列表、一键回滚
 - APK 安装、文件拖拽、剪贴板、截图录屏
 
@@ -52,6 +52,19 @@ AOSP 官方只提供 `ranchu` 虚拟板的镜像，那是 Android Emulator 专�
 - 分发：Developer ID 签名 + 公证 + 自建更新通道。**带 hypervisor 权限的 App 无法上架 Mac App Store**，这条不可绕过
 - 许可自查：见 `01-license-boundary.md`
 - 兼容性攻坚：这是无底洞，需要专门的测试矩阵
+
+## GPU 加速现状（2026-11-10 实测，详见 docs/07-gpu-virgl.md）
+
+Unity/重图形游戏的真正瓶颈在**客户机渲染**，不在显示传输（后者已由 VNC/ZRLE 解决）：
+
+- 原状态：`ANGLE (Vulkan 1.3.0 SwiftShader)`，纯 CPU 光栅化
+- **GPU 加速已达成（E7/E10）**：`startergo/qemu-virgl` + `virtio-gpu-gl-pci,blob=on,hostmem=1G,edid=off` + `memory-backend-file share=on`，镜像自带 virtgpu_detect 自动切 Mesa/virgl。实测 `GLES: Mesa, virgl (ANGLE (Apple M2 Pro, OpenGL 4.1 Metal))`——**客户机跑在宿主 Apple GPU 上**，AndroPod CLI 全链路已验证（E10，锁屏/桌面正常）
+- 三个必需 QEMU 开关：`blob=on`（默认关！）、`hostmem`、`share=on` backend；`edid=off` 是稳定性的关键（EDID 多模式集会触发 SF frame-rate 投票 LOG(FATAL) 死循环，E6→E7）
+- **客户机侧前置**：GRUB 需 `androidboot.selinux=permissive`（宿主安全策略不允许自动改，留用户/上游 grubenv 开关）；enforcing 下 udmabuf avc denied 影响面待重验
+- **三条 QEMU 硬限制**（E10）：virgl 必须 `-display cocoa,gl=es`（无 egl-headless）；`-vnc` 与 GL 互斥；QMP screendump 抓不到 GL 内容（黑帧）→ virgl 实例显示 = QEMU 窗口，GUI 内嵌画面暂不可用
+- venus（Vulkan）路径需要 crosvm 或 patched QEMU，当前只有 virgl（GL）；Unity 游戏多数可用 GLES 跑
+- 镜像上游：Camgobeg/android-lineage-qemu（有 recovery-userdebug、Magisk、GSI 路径），官方 LineageOS Wiki 已收录 UTM on Apple Silicon
+- 结论维持：**不自研 GPU 栈**；剩余工作 = enforcing sepolicy 验证、GUI virgl 画面通路、GL 性能基准与 Unity 实测
 
 ## 明确不做的事
 

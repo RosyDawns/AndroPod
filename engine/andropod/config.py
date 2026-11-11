@@ -34,6 +34,17 @@ class VMConfig:
     pflash_code: str | None = None
     pflash_vars: str | None = None
 
+    # MuMu-style direct kernel boot: the engine starts the extracted GKI
+    # kernel itself and OWNS the kernel cmdline — no EDK2, no GRUB, no
+    # grubenv. Requires runtime/images/boot-assets/{kernel,initrd.img};
+    # falls back to the UEFI/GRUB pflash path when absent or disabled.
+    # The two switches below are per-instance USER choices (GUI settings),
+    # defaulting to the image's own secure state — they only take effect
+    # when explicitly enabled.
+    direct_boot: bool = True
+    insecure_adb: bool = False
+    selinux_permissive: bool = False
+
     # Block devices. Paths are absolute, resolved at create time.
     disk: str | None = None
     disk_size_gb: int = 8
@@ -51,6 +62,29 @@ class VMConfig:
 
     gpu: bool = True
     headless: bool = True
+    # "2d" (default): virtio-gpu-pci, guest renders with SwiftShader.
+    #   The default is chosen for *recoverability*, not raw speed: it is the
+    #   only backend that can save and restore VM state. virgl answers
+    #   `savevm` with "virgl is not yet migratable" (E15), so a virgl instance
+    #   can never be resumed — it always pays a 30-40 s cold boot and can never
+    #   land straight on the launcher the way MuMu does. It also needs no
+    #   security relaxation: apps keep their own SELinux domain.
+    # "virgl": virtio-gpu-gl-pci from the qemu-virgl build — guest GLES goes
+    #   through Mesa/virgl to the host GPU. E11 measured 60 FPS / 11-13 ms GPU
+    #   frame time on a commercial Unity title, versus SwiftShader on 2D. It
+    #   needs a permissive SELinux in the guest (udmabuf access from app
+    #   processes, E9/E13); that switch stays a per-instance user choice, and
+    #   turning it on forfeits snapshots.
+    gpu_backend: str = "2d"
+
+    # Preferred guest display geometry. xres/yres are passed to virtio-gpu-pci
+    # (2D backend) as the initial surface size; dpi is metadata the UI shows
+    # (MuMu-style "1600 × 945 | 236 DPI"). The virgl backend pins its own mode
+    # with edid=off (E10), so xres/yres currently only apply to the 2D backend.
+    xres: int | None = None
+    yres: int | None = None
+    dpi: int | None = None
+
     # Attach a virtio touchscreen. Games and some system dialogs only react to
     # touch events, ignoring mouse-button events entirely.
     touch: bool = True
@@ -75,4 +109,11 @@ class VMConfig:
     def load(cls, path: Path) -> "VMConfig":
         raw = json.loads(path.read_text())
         known = {f for f in cls.__dataclass_fields__}
-        return cls(**{k: v for k, v in raw.items() if k in known})
+        # Drop nulls. An instance.json written before a field existed (or
+        # while it was still optional) can carry an explicit null, and passing
+        # None through would *override* the dataclass default — which is how
+        # `"gpu_backend": null` silently pinned old instances to SwiftShader
+        # long after virgl became the default.
+        return cls(**{
+            k: v for k, v in raw.items() if k in known and v is not None
+        })

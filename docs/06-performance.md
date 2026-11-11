@@ -163,3 +163,76 @@ RunLoop.main.add(timer, forMode: .common)   // 不是 scheduledTimer
 项目原先在 `~/Desktop`，而桌面受 TCC 保护。每次重新编译签名都会变，于是每次都重新弹「想访问桌面文件夹」，主线程阻塞在 `open()` 上等待用户点击——`sample` 抓到的栈就是 `loadInstances → open`。
 
 项目已迁到 `~/AndroPod`（桌面留符号链接），彻底绕开。同时用 `defaults write com.andropod.app ApplePersistenceIgnoreState -bool YES` 关掉状态恢复，否则每次强杀后重启都会弹「是否恢复窗口」的模态框，同样卡住启动。
+
+## 九、方案 C：把显示通路换成 VNC / ZRLE
+
+前八节都是在给 `screendump` 这条通路打补丁。它有一个无法靠调参消除的结构性缺陷：**轮询 + 全屏**。哪怕画面一个像素都没变，GUI 也会每 33 ms 让 QEMU 把 1280×800×3 = 3 MB 帧缓冲拷进一个文件，再读回来解码；而 `screendump` 本身跑在 QEMU 主循环里，直接占用客户机的 vCPU 时间。
+
+C 方案换成 QEMU 自带的 VNC 后端：它按 **framebuffer damage** 工作，只推送变化的矩形，并且是服务端主动推，宿主不再需要 60 Hz 轮询。
+
+### 实测：动态场景带宽
+
+客户机持续滑动（真实 UI 动画）时，`scripts/vnc_bench.py` 测 3 秒：
+
+| 编码 | 带宽 | 帧率 | 每帧 | 矩形数 |
+|---|---|---|---|---|
+| Raw | 2196 KB/s | 32.0 fps | 69 KB | 1348 |
+| Hextile | 1523 KB/s | — | — | — |
+| **ZRLE** | **382 KB/s** | 31.6 fps | 12 KB | 1325 |
+| Tight | 331 KB/s | — | — | — |
+
+对照 `screendump`：30 fps × 3 MB ≈ **90 000 KB/s**（不管画面变不变）。
+
+差距约 **230 倍**。而且帧率不是被压缩换来的：ZRLE 仍有 31.6 fps，与 Raw 的 32.0 fps 几乎相同。关键不在压缩算法，而在「只传变化区域」和「推模式」。
+
+静态桌面下 ZRLE 只有约 2 KB/s；GUI 端到端验证中，输入停止后 4 秒内 393 帧总共只累计 545 KB，fps 自然掉到 3.0（只有时钟在变）。**空闲设备几乎不再消耗 CPU 和带宽**，这是 MuMu 那类商业模拟器的基本手感来源。
+
+### 三个必须实测、不能靠猜的协议细节
+
+写 Swift 客户端前用 Python 参考实现（`scripts/zrle_reference.py`）把算法验证到与 `screendump` 逐像素一致，过程中踩到三个坑：
+
+1. **zlib 流是跨矩形、跨帧共享的。** QEMU 对每个 ZRLE 矩形做一次 `Z_SYNC_FLUSH`，但用的是连接级的一条 deflate 流。单独对每个矩形 `zlib.decompress()` 会报 `incomplete or truncated stream`。客户端必须为整条连接保持一个 `z_stream`，只在 `DesktopSize`（分辨率变化）时重建。参考实现里 `decompressobj()` 持续复用后，1340471 字节完整消费。
+
+2. **3 字节 CPIXEL 是 B,G,R，不是 R,G,B。** bpp=32 / depth=24 / max=255 / true-colour 时，RFB 允许去掉 padding 字节，只留 3 字节。我们设 `blue-shift=0`，所以留下的是低三字节，即内存序 B,G,R，**直接拷进 BGRA 前三位即可**。一开始按「通道值 R,G,B」处理，704 个采样点只对上 4 个，且首个像素恰好是 R/B 互换；改成直接拷贝后 **704/704 全部匹配**。
+
+3. **QEMU 采用客户端声明的第一个编码。** 声明顺序 `[ZRLE, CopyRect, Raw, DesktopSize]` → 收到的全是 ZRLE；换成 `[Raw, ...]` → 全是 Raw。所以 ZRLE 必须排在 `SetEncodings` 首位，否则压缩白做。
+
+另外 `-display none` 与 `-vnc` 可以同时启用（QEMU 11 实测），`-vnc 127.0.0.1:N` 监听的是 `5900 + N`，不是端口 N。
+
+### 落地结构
+
+- `engine/andropod/config.py` 增加 `vnc_display`；`vm.py` 生成 `-vnc 127.0.0.1:N,lossy=on`；`cli.py create` 自动分配未被占用的 display（`--no-vnc` 可关，`--vnc-display N` 可指定）。
+- `app/Sources/AndroPodCore/VNCClient.swift`：原生 RFB 3.8 客户端，只依赖系统 zlib（SDK 自带 modulemap，自动 link `z`），不引入第三方库。支持 ZRLE（Raw/Solid/PackedPalette/PlainRLE/PaletteRLE 五种 tile 子编码）、Raw、CopyRect、DesktopSize；维护 BGRA framebuffer，增量合成后生成 `CGImage`。
+- `AppModel` **双通路并存**：VNC 握手前保留 `screendump` 保证窗口不空白；收到第一帧真实 RFB 画面后永久停掉 poller；VNC 端口未就绪时最多重试 3 次（每次 `refresh` 2.5 s），仍失败则稳定回退并标注 `screendump（VNC 不可用）`。
+- 输入路径不变（仍是 QMP 直连 / 常驻 adb shell），VNC 只负责显示，职责单一。
+
+`refresh()` 每 2.5 s 会重跑显示初始化，所以「VNC 接管后不得重建 poller」必须显式判断 `vncReady`——否则会悄悄回到 3 MB/帧 的老路。诊断输出 `/tmp/andropod-gui.txt` 会打印 `displayMode`、`vncReady`、`vncClients` 与矩形编码分布，headless 也能确认走的是哪条路。
+
+### 验证结果
+
+| 验证 | 结果 |
+|---|---|
+| Python 参考解码 vs `screendump` | **704/704 像素一致** |
+| Swift 客户端静态帧 | 1280×800，画面与参考实现一致 |
+| Swift 客户端动态 40 帧 | 32.2 fps，109 个 ZRLE 矩形，0.59 ms/帧构建，无解码错误 |
+| GUI 端到端（动态） | `displayMode=VNC / ZRLE`，32.2 fps，200 帧，0.22 ms/帧，且诊断中无 `poller.lineage` |
+| GUI 端到端（静止） | fps 3.0，393 帧累计仅 545 KB |
+| `AndroPod --self-test` | VNC + screendump 两条通路均 PASS |
+
+复现命令：
+
+```bash
+./bin/andropod boot --name lineage --snapshot clean
+python3 scripts/vnc_bench.py --seconds 3 --encodings raw,zrle,hextile,tight
+python3 scripts/zrle_reference.py 24 3          # 逐像素校验
+swiftc -O -parse-as-library -o /tmp/vncverify \
+  app/Sources/AndroPodCore/VNCClient.swift scripts/VNCVerify.swift
+/tmp/vncverify 5901 /tmp/frame.png 40          # 需另开一个连接注入滑动
+ANDROPOD_ROOT="$PWD" app/.build/release/AndroPod --self-test
+```
+
+### 边界：这不等于能流畅玩 Unity 游戏
+
+C 方案优化的是**画面从客户机搬到宿主窗口**这一段，输入延迟和显示带宽都降下来了，但**客户机内部怎么把一帧画出来没有变**。渲染器仍是 SwiftShader 纯 CPU 软渲染：Unity 这类重图形负载的瓶颈在 Guest 的 GL 调用与合成，VNC 无法加速它。
+
+所以「玩 Unity 游戏」还差方案 A：让镜像支持 virgl / 宿主 GPU。此前实测 `qemu-virgl` 已装好、`virtio-gpu-gl-pci` 与 `cocoa,gl=es` 可用，但当前 LineageOS 镜像是按 2D `virtio-gpu-pci` 配套编译的，`ro.hardware.egl=angle`，且 `surfaceflinger` 因 `avc: denied { read write } name="udmabuf"` 反复重启导致 boot loop。要继续往下走，需要改镜像的 SELinux 策略与 EGL HAL，或换 Cuttlefish 方案。这属于下一阶段，不是调参能绕过的。

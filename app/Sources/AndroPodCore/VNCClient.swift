@@ -61,11 +61,27 @@ public final class VNCClient {
     /// A fatal transport/decode error. The caller should fall back to screendump.
     public var onFailure: ((Error) -> Void)?
 
+    /// Queue the callbacks are delivered on. Defaults to main for the UI; a
+    /// headless verification tool can point this elsewhere and use a semaphore
+    /// without running a runloop.
+    public var callbackQueue: DispatchQueue = .main
+
     public private(set) var isActive = false
     public private(set) var frameWidth = 0
     public private(set) var frameHeight = 0
     /// Bumped every time a full frame is published; useful for headless tests.
     public private(set) var deliveredFrames = 0
+
+    /// How many rectangles of each encoding we have decoded. Purely diagnostic:
+    /// a run that only ever sees ZRLE has not exercised CopyRect at all.
+    /// Access is guarded by `lock`, since the receive queue writes and the UI
+    /// may read concurrently.
+    private var encodingCountsStorage: [Int32: Int] = [:]
+    public var encodingCounts: [Int32: Int] {
+        lock.lock()
+        defer { lock.unlock() }
+        return encodingCountsStorage
+    }
 
     private let host: String
     private let port: Int
@@ -350,15 +366,21 @@ public final class VNCClient {
     private func run() {
         do {
             try connect()
-            let size = try handshake()
+            _ = try handshake()
             isActive = true
             statsEpoch = CFAbsoluteTimeGetCurrent()
-            publish(size: size, rebuild: true)
+            // Do NOT publish the freshly allocated (black) framebuffer. The
+            // full update requested during the handshake arrives immediately
+            // with the real screen; publishing an empty frame first would make
+            // the UI think VNC is ready and retire its screendump fallback
+            // while the window is still blank.
             try receiveLoop()
         } catch {
             isActive = false
             if !isStopped {
-                DispatchQueue.main.async { [weak self] in self?.onFailure?(error) }
+                callbackQueue.async { [weak self] in
+                    self?.onFailure?(error)
+                }
             }
         }
         shutdownSocket()
@@ -387,7 +409,7 @@ public final class VNCClient {
                     dirty += 1
                 }
                 if dirty > 0 && !resized {
-                    publish(size: (frameWidth, frameHeight), rebuild: false)
+                    publish()
                 }
                 // Ask for the next change only after consuming this one. This
                 // is the back-pressure that replaces the 60 Hz host timer.
@@ -410,6 +432,9 @@ public final class VNCClient {
 
     /// Returns true when the rectangle was a DesktopSize pseudo-encoding.
     private func applyRect(x: Int, y: Int, width: Int, height: Int, encoding: Int32) throws -> Bool {
+        lock.lock()
+        encodingCountsStorage[encoding, default: 0] += 1
+        lock.unlock()
         switch encoding {
         case Self.encRaw:
             let bytes = try readExactly(width * height * 4)
@@ -611,7 +636,8 @@ public final class VNCClient {
 
     // MARK: - publishing
 
-    private func publish(size: (Int, Int), rebuild: Bool) {
+    private func publish() {
+        let size = (frameWidth, frameHeight)
         let began = CFAbsoluteTimeGetCurrent()
         // Copy out of the mutable framebuffer. Handing a CGDataProvider a
         // buffer another thread keeps writing produces torn frames.
@@ -650,7 +676,7 @@ public final class VNCClient {
             statsEpoch = now
         }
         let received = bytesReceived
-        DispatchQueue.main.async { [weak self] in
+        callbackQueue.async { [weak self] in
             guard let self else { return }
             self.onFrame?(nsImage)
             self.onStats?(elapsed, fps, received, 0)

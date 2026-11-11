@@ -144,6 +144,10 @@ def provision(
         "settings put secure user_setup_complete 1",
         "settings put global device_provisioned 1",
         f"pm disable-user --user 0 {SETUP_WIZARD_PACKAGE}",
+        # MuMu 的客机不带原生状态栏/导航栏：应用内容占满整个画面。policy_control
+        # 在新版 Android 上可能已被移除——失败无害（settings 返回错误但进程为 0），
+        # 留在列表里让所有支持的版本都拿到一致的观感。
+        "settings put global policy_control immersive.full=*",
     ):
         shell(binary, serial, command, server_port, 40)
 
@@ -164,6 +168,19 @@ def provision(
         log(f"  {'成功' if success else '失败: ' + output.strip()[:200]}")
         if success:
             installed.append(apk.name)
+
+    # 模拟器桌面（MuMu 式产品层）：预装后接管 HOME 角色。由产品在初始化时
+    # 执行，不是运行中的设备上随手改——这是出厂配置的一部分。
+    home_apk = Path(__file__).resolve().parents[2] / "runtime" / "images" / "extra-apks" / "andropod-home.apk"
+    if home_apk.exists() and "com.andropod.home" not in installed:
+        log("安装模拟器桌面")
+        code, output = _adb(binary, ["-s", serial, "install", "-r", str(home_apk)], server_port, 600)
+        if code == 0 and "Success" in output:
+            installed.append("andropod-home.apk")
+            shell(binary, serial, "cmd role add-role-holder android.app.role.HOME com.andropod.home", server_port, 40)
+            log("  已安装并设为默认桌面")
+        else:
+            log(f"  失败: {output.strip()[:200]}")
     report["installed"] = installed
 
     code, output = shell(binary, serial, "getprop ro.build.version.release", server_port, 20)
