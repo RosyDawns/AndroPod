@@ -43,3 +43,4 @@ app/home-apk/*.p12
 # 运行时临时文件
 runtime/instances/*/
 *.png.orig
+*.o.tmp
