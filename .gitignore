@@ -24,8 +24,12 @@ runtime/instances/*
 *.sock
 *.log
 
-# QEMU 源码树与压缩包（1.8G，第三方上游；获取方式见 docs/08 与 third_party/README）
-third_party/
+# QEMU 源码树与压缩包（1.8G，第三方上游；获取方式见 docs/08 与 third_party/*
+!third_party/README.md
+!third_party/cocoa.mREADME）
+third_party/*
+!third_party/README.md
+!third_party/cocoa.m
 
 # 引擎构建产物（engine/embed/build_libqemu.sh 重新生成）
 engine/embed/libandropod-qemu.dylib

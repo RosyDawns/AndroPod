@@ -308,3 +308,52 @@ file.locking=off 后启动无锁错误
 
 现在的交互：点 × / Cmd+Q → sheet「要关闭 device-1 吗？」→ 取消=窗口保留；
 确认=客机正常关机（capabilities + quit）→ 主循环退出 → 进程 _exit。
+
+## E25（2026-11-11）：virgl GPU 显示冻结 —— 双头布局管理震荡
+
+用户开启 GPU 加速（virgl）后冷启动，窗口停在开机动画帧；客机一切正常
+（boot_completed=1、SurfaceFlinger 在跑、时钟前进）。期间我曾错误地把实例
+切回 2D——用户明确纠正：**开 GPU 就是要玩 3D 游戏，2D 不可接受**。
+
+### 量化定位（ANDROPOD_DISP_DEBUG 计数器通用化后）
+
+```
+glrefresh=138/5s   ← 30fps 主循环正常
+scanout=2 flush=2  ← 锁屏静止时客机只推分钟帧（正常节能）
+render=15 swapfail=0 ← EGL 渲染 + swap 无失败
+```
+
+链接路每一环都健康，坏的是**布局管理权分裂**：
+
+- QEMU 侧 `resizeWindow`（嵌入分支）：每次表面变化把视图 bounds 强设为
+  **客机像素**（1600×945，E14 时代"窗口=像素"的遗产）
+- player 侧 `fitGuestView`（E21b 引入）：每次布局把 frame 设回**窗口点尺寸**
+  （800×473）
+
+两边互相触发：setBounds → AppKit 通知 → fitGuestView 改回 → QEMU 下次
+resizeWindow 再改……EGL surface 在两个尺寸间反复销毁重建（resized 计数
+11/5s），ANGLESwap layer 被 `cocoa_gl_fit_layer` 每帧校正到跳动的 bounds。
+开机动画能显示是因为震荡从 SystemUI 接管 scanout 后才全面爆发。
+
+### 修复
+
+**布局单一管理权**：嵌入模式下 QEMU 的 `resizeWindow` 不再改 bounds
+（frame 的唯一管理者是 player 的 fitGuestView），只触发 relayout 让 EGL
+surface 跟随；ANGLE layer 的铺满由 `cocoa_gl_fit_layer` 每帧按当前 bounds
+校正（它本来就是这个职责，注释里"视图 bounds 必须等于像素数"的前提已被
+fit_layer 取代）。
+
+### 验证（virgl + 冷启动）
+
+```
+客机渲染器：GLES: Mesa, virgl (ANGLE (Apple M2 Pro, OpenGL 4.1 Metal))
+锁屏大时钟 07:47 与真实时间一致；滑动解锁画面实时跟随
+主循环 30fps 稳定；resized 只在真实布局变化时发生
+```
+
+### 工程化
+
+`third_party/cocoa.m`（最终版全文）入库：v07 的 cocoa 段上下文与原始树
+漂移，diff 补丁无法保证幂等，文件覆盖永远可复现。`third_party/README.md`
+更新两步补丁流程（v07 → 覆盖 cocoa.m）。计数器（cocoa_count）通用化为
+任意事件名，`resized` 只在真正重建时计数。
